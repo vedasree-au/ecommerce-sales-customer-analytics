@@ -9,20 +9,45 @@
 USE ecommerce_analytics;
 
 -- ================================================================
--- 01. DATA LOAD
+-- 01. SAFE DATA LOAD (STAGING TABLE)
 -- ================================================================
--- NOTE: Update the LOCAL INFILE path below if the project folder
--- is moved to another machine or directory.
+-- MySQL 8+. Run this script in the order described below.
+--
+-- IMPORTANT:
+-- 1) The CSV is loaded into sales_staging first.
+-- 2) Existing rows in sales are NOT deleted during the import.
+-- 3) Check the staging validation results in Section 02.
+-- 4) Only after they match the expected values, execute the
+--    PROMOTE STAGING DATA block below Section 02.
+--
+-- Update the CSV path if you move the project folder.
+-- The path below matches the project location visible in your VS Code.
 
 SHOW VARIABLES LIKE 'local_infile';
 
-TRUNCATE TABLE sales;
+CREATE TABLE IF NOT EXISTS sales (
+    invoice VARCHAR(20),
+    stockcode VARCHAR(20),
+    description VARCHAR(255),
+    quantity INT,
+    invoicedate DATETIME,
+    price DECIMAL(10,2),
+    customer_id INT,
+    country VARCHAR(100),
+    is_cancelled BOOLEAN,
+    revenue DECIMAL(12,2)
+);
+
+-- Only the staging table is cleared and reloaded.
+CREATE TABLE IF NOT EXISTS sales_staging LIKE sales;
+TRUNCATE TABLE sales_staging;
+
 LOAD DATA LOCAL INFILE
 'C:/Users/vedas/Downloads/E-Commerce-Sales-Customer-Analytics-main/E-Commerce-Sales-Customer-Analytics-main/data/cleaned_sales.csv'
-INTO TABLE sales
+INTO TABLE sales_staging
 FIELDS TERMINATED BY ','
 ENCLOSED BY '"'
-LINES TERMINATED BY '\n'
+LINES TERMINATED BY '\\n'
 IGNORE 1 ROWS
 (
     invoice,
@@ -33,9 +58,77 @@ IGNORE 1 ROWS
     price,
     customer_id,
     country,
-    is_cancelled,
+    @is_cancelled,
     revenue
-);
+)
+SET is_cancelled = CASE LOWER(TRIM(@is_cancelled))
+    WHEN 'false' THEN 0
+    WHEN 'true' THEN 1
+    WHEN '0' THEN 0
+    WHEN '1' THEN 1
+    ELSE NULL
+END;
+
+-- ================================================================
+-- 02. STAGING DATA VALIDATION - CHECK THESE RESULTS FIRST
+-- ================================================================
+
+SELECT COUNT(*) AS staging_rows
+FROM sales_staging;
+
+SELECT
+    is_cancelled,
+    COUNT(*) AS rows_count
+FROM sales_staging
+GROUP BY is_cancelled;
+
+SELECT
+    COUNT(*) AS total_rows,
+    SUM(is_cancelled IS NULL) AS invalid_or_missing_cancel_flags,
+    SUM(invoice IS NULL) AS missing_invoice,
+    SUM(invoicedate IS NULL) AS missing_date,
+    SUM(revenue IS NULL) AS missing_revenue,
+    ROUND(SUM(revenue), 2) AS staging_revenue,
+    COUNT(DISTINCT invoice) AS unique_orders,
+    SUM(quantity) AS total_units,
+    COUNT(DISTINCT customer_id) AS identified_customers
+FROM sales_staging;
+
+-- Expected for the current cleaned_sales.csv:
+-- rows = 993401; cancelled flag = 0 for all rows
+-- revenue = 19433661.76; orders = 39492
+-- units = 11097626; identified customers = 5851
+--
+-- ================================================================
+-- 02A. PROMOTE STAGING DATA INTO THE MAIN SALES TABLE
+-- ================================================================
+-- IMPORTANT: Execute this block ONLY after the staging validation
+-- above matches the expected values. Uncomment this block, execute it,
+-- then run the analytical sections below. It replaces sales contents.
+-- The DELETE/INSERT is transactional when sales uses InnoDB.
+
+-- START TRANSACTION;
+--
+-- DELETE FROM sales;
+
+INSERT INTO sales (
+    invoice, stockcode, description, quantity, invoicedate,
+    price, customer_id, country, is_cancelled, revenue
+)
+SELECT
+    invoice, stockcode, description, quantity, invoicedate,
+    price, customer_id, country, is_cancelled, revenue
+FROM sales_staging;
+
+COMMIT;
+
+SELECT
+    COUNT(*) AS sales_rows,
+    ROUND(SUM(revenue), 2) AS sales_revenue,
+    COUNT(DISTINCT invoice) AS unique_orders,
+    SUM(quantity) AS total_units,
+    COUNT(DISTINCT customer_id) AS identified_customers
+FROM sales;
 
 -- ================================================================
 -- 02. RAW TRANSACTION VALIDATION
@@ -108,7 +201,7 @@ WHERE customer_id IS NOT NULL
 -- ================================================================
 -- 03. ANALYTICAL VIEWS
 --
--- clean_sales       = all non-cancelled transaction rows
+-- clean_sales       = all non-cancelled transaction rows (current CSV: all FALSE)
 -- customer_sales    = identified-customer transactions
 -- merchandise_sales  = product/merchandise transactions only
 -- ================================================================
@@ -116,7 +209,7 @@ WHERE customer_id IS NOT NULL
 CREATE OR REPLACE VIEW clean_sales AS
 SELECT *
 FROM sales
-WHERE UPPER(TRIM(is_cancelled)) = 'FALSE';
+WHERE is_cancelled = FALSE;
 
 CREATE OR REPLACE VIEW customer_sales AS
 SELECT *
